@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+"""
+Robust Cybersecurity Job Hunter
+================================
+
+Searches the supplied 50-company target list for cybersecurity jobs,
+deduplicates results, extracts job metadata, scores each role against
+a SIEM/SOAR-focused profile, and exports CSV + HTML reports.
+
+IMPORTANT:
+- This is a discovery/ranking tool, NOT an auto-apply bot.
+- Search engines and career sites can block automation.
+- Always verify the final job on the employer's official careers page.
+- A company mention in a third-party job is NOT treated as an employer match.
+
+Profile emphasis:
+Google SecOps / Chronicle, SOAR, Splunk, CrowdStrike NG SIEM,
+BindPlane, Cribl, YARA-L, detection engineering, log ingestion,
+parsing/transformation, dashboards, SIEM migration and automation.
+
+Install:
+    pip install ddgs pandas requests beautifulsoup4
+
+Run:
+    python cybersecurity_job_hunter.py
+
+Useful modes:
+    python cybersecurity_job_hunter.py --fetch-pages
+    python cybersecurity_job_hunter.py --max-results 6 --workers 8
+    python cybersecurity_job_hunter.py --min-score 35
+"""
+
+import argparse
+import html
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, quote_plus
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from ddgs import DDGS
+
+
+# ---------------------------------------------------------------------
+# 1. Target companies from the supplied image
+# ---------------------------------------------------------------------
+COMPANIES = [
+    "Palo Alto Networks",
+    "CrowdStrike",
+    "Microsoft Security",
+    "Google Cloud Security",
+    "SentinelOne",
+    "Darktrace",
+    "Fortinet",
+    "Cisco Security",
+    "Check Point Software",
+    "IBM Security",
+    "Zscaler",
+    "Vectra AI",
+    "CyberArk",
+    "Okta",
+    "Cloudflare",
+    "Proofpoint",
+    "Trellix",
+    "Sophos",
+    "Rapid7",
+    "Elastic",
+    "Arctic Wolf",
+    "ReliaQuest",
+    "Exabeam",
+    "Securonix",
+    "Abnormal Security",
+    "Recorded Future",
+    "Tenable",
+    "Qualys",
+    "Wiz",
+    "Akamai",
+    "Bitdefender",
+    "Trend Micro",
+    "BlackBerry Cylance",
+    "Cybereason",
+    "eSentire",
+    "Huntress",
+    "Expel",
+    "Dropzone AI",
+    "Torq",
+    "Simbian",
+    "Prophet Security",
+    "Radiant Security",
+    "Stellar Cyber",
+    "Lakera",
+    "Protect AI",
+    "HiddenLayer",
+    "Mindgard",
+    "Robust Intelligence",
+    "Netskope",
+    "SparkCognition",
+]
+
+
+# ---------------------------------------------------------------------
+# 2. Search preferences
+# ---------------------------------------------------------------------
+TARGET_LOCATIONS = {
+    "Hyderabad": 12,
+    "Remote India": 10,
+    "Remote": 8,
+    "India": 6,
+    "Bengaluru": 5,
+    "Pune": 5,
+    "Gurugram": 4,
+    "Chennai": 4,
+    "Mumbai": 4,
+    "Noida": 4,
+}
+
+REMOTE_TERMS = [
+    "remote",
+    "work from home",
+    "wfh",
+    "remote india",
+    "india remote",
+]
+
+INDIA_TERMS = [
+    "india",
+    "hyderabad",
+    "bengaluru",
+    "bangalore",
+    "pune",
+    "gurugram",
+    "gurgaon",
+    "chennai",
+    "mumbai",
+    "noida",
+    "delhi",
+]
+
+TITLE_KEYWORDS = {
+    "senior cyber security lead": 16,
+    "senior cybersecurity lead": 16,
+    "cyber security lead": 15,
+    "cybersecurity lead": 15,
+    "senior security engineer": 14,
+    "senior cybersecurity engineer": 15,
+    "senior cyber security engineer": 15,
+    "security platform engineer": 14,
+    "security engineer": 10,
+    "cybersecurity engineer": 12,
+    "cyber security engineer": 12,
+    "siem engineer": 14,
+    "siem": 9,
+    "soar engineer": 14,
+    "soar": 10,
+    "detection engineer": 14,
+    "security operations": 10,
+    "soc engineer": 10,
+    "security consultant": 9,
+    "technical consultant": 8,
+    "professional services consultant": 10,
+    "security architect": 12,
+    "cybersecurity architect": 14,
+    "security content": 12,
+    "security automation": 11,
+}
+
+SKILL_KEYWORDS = {
+    "google secops": 18,
+    "chronicle": 18,
+    "google security operations": 18,
+    "splunk": 13,
+    "splunk es": 14,
+    "enterprise security": 7,
+    "soar": 11,
+    "siem": 11,
+    "crowdstrike": 9,
+    "ng siem": 14,
+    "bindplane": 16,
+    "cribl": 14,
+    "yara-l": 16,
+    "yara": 8,
+    "log ingestion": 10,
+    "log onboarding": 10,
+    "log management": 8,
+    "log pipeline": 9,
+    "log parsing": 8,
+    "parsing": 6,
+    "normalization": 7,
+    "data transformation": 7,
+    "detection engineering": 12,
+    "detection rules": 9,
+    "correlation rules": 9,
+    "threat detection": 9,
+    "security monitoring": 8,
+    "siem migration": 14,
+    "soar playbook": 13,
+    "playbook": 8,
+    "security automation": 9,
+    "incident response": 7,
+    "github actions": 5,
+    "python": 4,
+    "microsoft sentinel": 8,
+    "xsiam": 8,
+    "xdr": 6,
+    "aws": 3,
+}
+
+NEGATIVE_KEYWORDS = {
+    "sales": -18,
+    "account executive": -18,
+    "account manager": -12,
+    "marketing": -18,
+    "recruiter": -18,
+    "human resources": -18,
+    "talent acquisition": -18,
+    "frontend developer": -15,
+    "backend developer": -10,
+    "software developer": -8,
+    "data scientist": -7,
+}
+
+
+# ---------------------------------------------------------------------
+# 3. Search queries
+# ---------------------------------------------------------------------
+SEARCH_QUERIES = [
+    '"SIEM" "SOAR"',
+    '"Google SecOps" OR Chronicle',
+    '"Splunk" cybersecurity',
+    '"security operations" engineer',
+    '"detection engineer" cybersecurity',
+    '"security engineer" SIEM',
+    '"cyber security lead"',
+    '"cybersecurity engineer"',
+    '"security platform" engineer',
+    '"SOAR" engineer',
+    '"security automation"',
+    '"professional services" cybersecurity',
+]
+
+
+# Known job aggregators/social sites. These are useful for discovery but
+# are never treated as proof that the target company is the employer.
+AGGREGATOR_DOMAINS = {
+    "linkedin.com",
+    "indeed.com",
+    "glassdoor.com",
+    "foundit.in",
+    "naukri.com",
+    "ziprecruiter.com",
+    "dice.com",
+    "talent.com",
+    "jooble.org",
+    "simplyhired.com",
+}
+
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0 Safari/537.36"
+    )
+}
+
+
+# ---------------------------------------------------------------------
+# 4. Helpers
+# ---------------------------------------------------------------------
+def clean_text(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def normalize_company(value):
+    """Normalize names so minor spelling differences do not break matching."""
+    value = clean_text(value).lower()
+    replacements = {
+        "microsoft security": "microsoft",
+        "google cloud security": "google",
+        "google security": "google",
+        "blackberry cylance": "blackberry",
+        "checkpoint software": "check point software",
+        "check point": "check point software",
+    }
+    return replacements.get(value, value)
+
+
+def normalize_url(url):
+    """Remove tracking parameters and normalize URLs for deduplication."""
+    try:
+        p = urlparse(url)
+        host = p.netloc.lower().replace("www.", "")
+        path = re.sub(r"/+", "/", p.path).rstrip("/")
+        return f"https://{host}{path}"
+    except Exception:
+        return url
+
+
+def domain(url):
+    try:
+        return urlparse(url).netloc.lower().replace("www.", "")
+    except Exception:
+        return ""
+
+
+def is_aggregator(url):
+    host = domain(url)
+    return any(host == d or host.endswith("." + d) for d in AGGREGATOR_DOMAINS)
+
+
+def find_matches(text, keyword_dict):
+    lower = text.lower()
+    return [k for k in keyword_dict if k.lower() in lower]
+
+
+def location_matches(text):
+    lower = text.lower()
+    found = []
+
+    if any(x in lower for x in ["hyderabad", "secunderabad"]):
+        found.append("Hyderabad")
+
+    if any(x in lower for x in ["remote india", "india remote"]):
+        found.append("Remote India")
+    elif "remote" in lower or "work from home" in lower or "wfh" in lower:
+        found.append("Remote")
+
+    if re.search(r"\bindia\b", lower) and "India" not in found:
+        found.append("India")
+
+    mappings = {
+        "bengaluru": "Bengaluru",
+        "bangalore": "Bengaluru",
+        "pune": "Pune",
+        "gurugram": "Gurugram",
+        "gurgaon": "Gurugram",
+        "chennai": "Chennai",
+        "mumbai": "Mumbai",
+        "noida": "Noida",
+    }
+
+    for key, label in mappings.items():
+        if key in lower and label not in found:
+            found.append(label)
+
+    return found
+
+
+def classify_location(matches):
+    if "Hyderabad" in matches:
+        return "HYDERABAD"
+    if "Remote India" in matches:
+        return "REMOTE INDIA"
+    if "Remote" in matches:
+        return "REMOTE"
+    if "India" in matches:
+        return "INDIA"
+    if matches:
+        return matches[0].upper()
+    return "OTHER / UNKNOWN"
+
+
+def extract_date(text):
+    """
+    Try to identify a posted-date signal from snippets/pages.
+    Returns ISO date when confidently parseable, otherwise blank.
+    """
+    text = clean_text(text).lower()
+    now = datetime.now(timezone.utc).date()
+
+    patterns = [
+        (r"(\d+)\s+day[s]?\s+ago", "days"),
+        (r"(\d+)\s+hour[s]?\s+ago", "hours"),
+        (r"(\d+)\s+week[s]?\s+ago", "weeks"),
+        (r"(\d+)\s+month[s]?\s+ago", "months"),
+    ]
+
+    for pattern, unit in patterns:
+        m = re.search(pattern, text)
+        if not m:
+            continue
+
+        n = int(m.group(1))
+        if unit == "days":
+            d = now - timedelta(days=n)
+        elif unit == "hours":
+            d = now
+        elif unit == "weeks":
+            d = now - timedelta(weeks=n)
+        else:
+            d = now - timedelta(days=30 * n)
+
+        return d.isoformat()
+
+    # Common absolute dates
+    for pattern in [
+        r"(\d{4})-(\d{1,2})-(\d{1,2})",
+        r"(\d{1,2})/(\d{1,2})/(\d{4})",
+    ]:
+        m = re.search(pattern, text)
+        if m:
+            try:
+                if "-" in m.group(0):
+                    d = datetime(
+                        int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    ).date()
+                else:
+                    d = datetime(
+                        int(m.group(3)), int(m.group(1)), int(m.group(2))
+                    ).date()
+                return d.isoformat()
+            except ValueError:
+                pass
+
+    return ""
+
+
+def company_is_employer(company, title, snippet, url):
+    """
+    Conservative employer detection.
+
+    A result is NOT considered a target-company job simply because the
+    company's product appears in the description. Search-result pages
+    from aggregators remain 'unverified' unless the company name is
+    explicitly present in the result metadata/text.
+    """
+    haystack = clean_text(f"{title} {snippet}").lower()
+    company_norm = normalize_company(company)
+
+    aliases = {
+        "palo alto networks": ["palo alto networks", "palo alto"],
+        "crowdstrike": ["crowdstrike"],
+        "microsoft security": ["microsoft"],
+        "google cloud security": ["google"],
+        "sentinelone": ["sentinelone", "sentinel one"],
+        "darktrace": ["darktrace"],
+        "fortinet": ["fortinet"],
+        "cisco security": ["cisco"],
+        "check point software": ["check point", "checkpoint"],
+        "ibm security": ["ibm"],
+        "zscaler": ["zscaler"],
+        "cyberark": ["cyberark"],
+        "okta": ["okta"],
+        "cloudflare": ["cloudflare"],
+        "proofpoint": ["proofpoint"],
+        "trellix": ["trellix"],
+        "sophos": ["sophos"],
+        "rapid7": ["rapid7"],
+        "elastic": ["elastic"],
+        "arctic wolf": ["arctic wolf"],
+        "reliaquest": ["reliaquest"],
+        "exabeam": ["exabeam"],
+        "securonix": ["securonix"],
+        "tenable": ["tenable"],
+        "qualys": ["qualys"],
+        "wiz": ["wiz"],
+        "akamai": ["akamai"],
+        "netskope": ["netskope"],
+    }
+
+    candidates = aliases.get(company_norm, [company_norm])
+    return any(a in haystack for a in candidates)
+
+
+def probable_job(row):
+    text = clean_text(
+        f'{row["title"]} {row["snippet"]}'
+    ).lower()
+
+    job_terms = [
+        "job", "career", "careers", "engineer", "consultant",
+        "analyst", "manager", "lead", "architect", "security",
+        "siem", "soar", "soc",
+    ]
+
+    non_job_terms = [
+        "press release", "webinar", "podcast", "event",
+        "whitepaper", "research report", "blog",
+    ]
+
+    return (
+        any(x in text for x in job_terms)
+        and not any(x in text for x in non_job_terms)
+    )
+
+
+def fetch_page_text(url, timeout=10):
+    """Fetch public job page text for deeper scoring."""
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if response.status_code >= 400:
+            return ""
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        for tag in soup(["script", "style", "noscript", "svg"]):
+            tag.decompose()
+
+        return clean_text(
+            soup.get_text(" ", strip=True)
+        )[:50000]
+
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------
+# 5. Search
+# ---------------------------------------------------------------------
+def make_queries(company):
+    location_part = (
+        '("Hyderabad" OR "India" OR "Remote" OR "Bengaluru" OR '
+        '"Pune" OR "Gurugram")'
+    )
+
+    queries = []
+
+    for q in SEARCH_QUERIES:
+        queries.append(f'"{company}" {q} {location_part}')
+
+    queries += [
+        f'"{company}" careers cybersecurity Hyderabad',
+        f'"{company}" careers cybersecurity India',
+        f'"{company}" jobs SIEM SOAR India',
+        f'"{company}" jobs Splunk SIEM India',
+        f'"{company}" jobs Google SecOps Chronicle',
+        f'"{company}" jobs detection engineer India',
+    ]
+
+    return queries
+
+
+def search_company(company, max_results, pause):
+    rows = []
+    seen = set()
+
+    try:
+        with DDGS() as ddgs:
+            for query in make_queries(company):
+                try:
+                    results = ddgs.text(
+                        query,
+                        max_results=max_results,
+                        safesearch="moderate",
+                    )
+
+                    for item in results:
+                        url = item.get("href") or item.get("url") or ""
+                        if not url:
+                            continue
+
+                        norm = normalize_url(url)
+                        if norm in seen:
+                            continue
+
+                        seen.add(norm)
+
+                        title = clean_text(item.get("title"))
+                        snippet = clean_text(item.get("body"))
+
+                        if not probable_job({
+                            "title": title,
+                            "snippet": snippet,
+                        }):
+                            continue
+
+                        employer_verified = company_is_employer(
+                            company, title, snippet, url
+                        )
+
+                        rows.append({
+                            "target_company": company,
+                            "title": title,
+                            "url": url,
+                            "normalized_url": norm,
+                            "domain": domain(url),
+                            "source_type": (
+                                "AGGREGATOR"
+                                if is_aggregator(url)
+                                else "DIRECT/OTHER"
+                            ),
+                            "employer_verified_in_result":
+                                employer_verified,
+                            "snippet": snippet,
+                            "search_query": query,
+                        })
+
+                    time.sleep(pause)
+
+                except Exception as exc:
+                    print(
+                        f"[WARN] {company}: query failed: "
+                        f"{exc}"
+                    )
+
+    except Exception as exc:
+        print(f"[ERROR] {company}: {exc}")
+
+    return rows
+
+
+# ---------------------------------------------------------------------
+# 6. Scoring
+# ---------------------------------------------------------------------
+def score_row(row):
+    title = clean_text(row["title"])
+    snippet = clean_text(row["snippet"])
+    page = clean_text(row.get("page_text", ""))
+
+    combined = f"{title} {snippet} {page}"
+
+    title_matches = find_matches(title, TITLE_KEYWORDS)
+    skill_matches = find_matches(combined, SKILL_KEYWORDS)
+    negative_matches = find_matches(combined, NEGATIVE_KEYWORDS)
+    loc_matches = location_matches(combined)
+
+    title_score = sum(TITLE_KEYWORDS[k] for k in title_matches)
+    skill_score = sum(SKILL_KEYWORDS[k] for k in skill_matches)
+    negative_score = sum(NEGATIVE_KEYWORDS[k] for k in negative_matches)
+
+    location_score = sum(
+        TARGET_LOCATIONS.get(k, 0) for k in loc_matches
+    )
+
+    # Strong combinations
+    combo = 0
+    lower = combined.lower()
+
+    if "google secops" in lower or "chronicle" in lower:
+        combo += 12
+
+    if "splunk" in lower and "siem" in lower:
+        combo += 8
+
+    if "soar" in lower and "siem" in lower:
+        combo += 8
+
+    if "bindplane" in lower:
+        combo += 8
+
+    if "cribl" in lower:
+        combo += 8
+
+    if "crowdstrike" in lower and "siem" in lower:
+        combo += 6
+
+    if "yara-l" in lower:
+        combo += 7
+
+    # Employer verification is important.
+    verification_bonus = 5 if row["employer_verified_in_result"] else 0
+
+    # Direct employer career pages get a small source-quality bonus.
+    direct_bonus = 4 if (
+        row["source_type"] == "DIRECT/OTHER"
+        and not is_aggregator(row["url"])
+    ) else 0
+
+    raw_score = (
+        title_score
+        + skill_score
+        + location_score
+        + negative_score
+        + combo
+        + verification_bonus
+        + direct_bonus
+    )
+
+    score = max(0, min(100, raw_score))
+
+    if score >= 65:
+        fit = "EXCELLENT MATCH"
+    elif score >= 50:
+        fit = "STRONG MATCH"
+    elif score >= 35:
+        fit = "POSSIBLE MATCH"
+    else:
+        fit = "LOW MATCH"
+
+    # Identify the most useful gaps.
+    desired = [
+        "Google SecOps",
+        "SOAR",
+        "SIEM",
+        "Splunk",
+        "CrowdStrike",
+        "Cribl",
+        "BindPlane",
+        "YARA-L",
+        "Detection Engineering",
+        "Log ingestion",
+    ]
+
+    missing = [
+        x for x in desired
+        if x.lower() not in combined.lower()
+    ]
+
+    row.update({
+        "score": score,
+        "fit": fit,
+        "location": classify_location(loc_matches),
+        "location_matches": ", ".join(loc_matches),
+        "title_matches": ", ".join(title_matches),
+        "skill_matches": ", ".join(skill_matches),
+        "negative_matches": ", ".join(negative_matches),
+        "missing_profile_terms": ", ".join(missing[:6]),
+        "posted_date_signal": extract_date(
+            f'{title} {snippet} {page}'
+        ),
+    })
+
+    return row
+
+
+# ---------------------------------------------------------------------
+# 7. Reports
+# ---------------------------------------------------------------------
+def make_fallback_search(company):
+    q = quote_plus(
+        f'"{company}" cybersecurity SIEM SOAR '
+        f'Hyderabad India Remote jobs'
+    )
+    return f"https://www.google.com/search?q={q}"
+
+
+def export_reports(df, output_prefix):
+    csv_file = f"{output_prefix}.csv"
+    html_file = f"{output_prefix}.html"
+
+    df.to_csv(
+        csv_file,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    # Make URLs clickable in HTML
+    display_df = df.copy()
+    if "url" in display_df.columns:
+        display_df["url"] = display_df["url"].apply(
+            lambda u: (
+                f'<a href="{html.escape(str(u))}" target="_blank">'
+                f'Open job</a>'
+            )
+        )
+
+    if "fallback_search" in display_df.columns:
+        display_df["fallback_search"] = display_df[
+            "fallback_search"
+        ].apply(
+            lambda u: (
+                f'<a href="{html.escape(str(u))}" target="_blank">'
+                f'Search</a>'
+            )
+        )
+
+    html_table = display_df.to_html(
+        index=False,
+        escape=False,
+        justify="left",
+    )
+
+    generated = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    html_doc = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Cybersecurity Job Hunter</title>
+<style>
+body {{
+    font-family: Arial, sans-serif;
+    margin: 25px;
+}}
+h1 {{ margin-bottom: 5px; }}
+.summary {{
+    padding: 12px;
+    border: 1px solid #ddd;
+    margin-bottom: 20px;
+}}
+table {{
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13px;
+}}
+th, td {{
+    border: 1px solid #ddd;
+    padding: 7px;
+    vertical-align: top;
+}}
+th {{
+    position: sticky;
+    top: 0;
+    background: #f5f5f5;
+}}
+a {{ word-break: break-all; }}
+</style>
+</head>
+<body>
+<h1>Cybersecurity Job Hunter</h1>
+<div class="summary">
+<b>Profile:</b> SIEM / SOAR / Google SecOps / Splunk /
+CrowdStrike NG SIEM / BindPlane / Cribl / YARA-L<br>
+<b>Target:</b> Hyderabad / Remote India / India<br>
+<b>Generated:</b> {generated}<br>
+<b>Results:</b> {len(df)}
+</div>
+{html_table}
+</body>
+</html>"""
+
+    with open(html_file, "w", encoding="utf-8") as f:
+        f.write(html_doc)
+
+    return csv_file, html_file
+
+
+# ---------------------------------------------------------------------
+# 8. Main
+# ---------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Robust SIEM/SOAR cybersecurity job hunter"
+    )
+
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=5,
+        help="Search results per query/company.",
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=6,
+        help="Companies searched in parallel.",
+    )
+
+    parser.add_argument(
+        "--min-score",
+        type=int,
+        default=30,
+        help="Minimum score exported.",
+    )
+
+    parser.add_argument(
+        "--fetch-pages",
+        action="store_true",
+        help="Fetch pages for deeper scoring.",
+    )
+
+    parser.add_argument(
+        "--fresh-days",
+        type=int,
+        default=14,
+        help="Preferred freshness window for report labeling.",
+    )
+
+    args = parser.parse_args()
+
+    print("=" * 75)
+    print("ROBUST CYBERSECURITY JOB HUNTER")
+    print("=" * 75)
+    print(f"Target companies : {len(COMPANIES)}")
+    print("Locations        : Hyderabad / Remote India / India")
+    print(f"Minimum score    : {args.min_score}")
+    print(f"Freshness target : {args.fresh_days} days")
+    print()
+
+    all_rows = []
+
+    with ThreadPoolExecutor(
+        max_workers=args.workers
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                search_company,
+                company,
+                args.max_results,
+                0.20,
+            ): company
+            for company in COMPANIES
+        }
+
+        for future in as_completed(futures):
+            company = futures[future]
+
+            try:
+                rows = future.result()
+                print(
+                    f"[OK] {company:<28} "
+                    f"{len(rows):>4} candidates"
+                )
+                all_rows.extend(rows)
+
+            except Exception as exc:
+                print(
+                    f"[ERROR] {company}: {exc}"
+                )
+
+    if not all_rows:
+        print(
+            "\nNo results were returned. "
+            "Search engines may be rate-limiting requests."
+        )
+        return
+
+    df = pd.DataFrame(all_rows)
+
+    # Deduplicate by normalized URL.
+    df = df.drop_duplicates(
+        subset=["normalized_url"]
+    ).copy()
+
+    print(
+        f"\nUnique results after URL deduplication: "
+        f"{len(df)}"
+    )
+
+    # Optional deeper inspection.
+    if args.fetch_pages:
+        print("\nFetching job pages for deeper matching...")
+
+        page_map = {}
+
+        with ThreadPoolExecutor(
+            max_workers=10
+        ) as executor:
+
+            futures = {
+                executor.submit(
+                    fetch_page_text,
+                    url
+                ): url
+                for url in df["url"]
+            }
+
+            for future in as_completed(futures):
+                url = futures[future]
+
+                try:
+                    page_map[url] = future.result()
+                except Exception:
+                    page_map[url] = ""
+
+        df["page_text"] = df["url"].map(
+            page_map
+        ).fillna("")
+
+    else:
+        df["page_text"] = ""
+
+    # Score all results.
+    scored = [
+        score_row(row.to_dict())
+        for _, row in df.iterrows()
+    ]
+
+    df = pd.DataFrame(scored)
+
+    # Add fallback search.
+    df["fallback_search"] = df[
+        "target_company"
+    ].map(make_fallback_search)
+
+    # Keep only target-company jobs when the result actually identifies
+    # the company as employer. If uncertain, retain them but flag them.
+    df["employer_status"] = df[
+        "employer_verified_in_result"
+    ].map({
+        True: "TARGET COMPANY VERIFIED",
+        False: "VERIFY EMPLOYER",
+    })
+
+    # Freshness flag based only on explicit date signals.
+    cutoff = (
+        datetime.now(timezone.utc).date()
+        - timedelta(days=args.fresh_days)
+    ).isoformat()
+
+    def freshness(value):
+        if not value:
+            return "DATE NOT CONFIRMED"
+        if value >= cutoff:
+            return "RECENT SIGNAL"
+        return "OLDER/UNKNOWN"
+
+    df["freshness"] = df[
+        "posted_date_signal"
+    ].apply(freshness)
+
+    # Filter.
+    df = df[
+        df["score"] >= args.min_score
+    ].copy()
+
+    # Prefer:
+    # 1. score
+    # 2. Hyderabad
+    # 3. Remote India
+    # 4. India
+    # 5. verified employer
+    location_rank = {
+        "HYDERABAD": 5,
+        "REMOTE INDIA": 4,
+        "REMOTE": 3,
+        "INDIA": 2,
+    }
+
+    df["_location_rank"] = df[
+        "location"
+    ].map(location_rank).fillna(0)
+
+    df["_verified_rank"] = df[
+        "employer_verified_in_result"
+    ].astype(int)
+
+    df = df.sort_values(
+        by=[
+            "score",
+            "_location_rank",
+            "_verified_rank",
+        ],
+        ascending=False,
+    ).reset_index(drop=True)
+
+    # Final columns
+    columns = [
+        "score",
+        "fit",
+        "target_company",
+        "employer_status",
+        "title",
+        "location",
+        "freshness",
+        "posted_date_signal",
+        "title_matches",
+        "skill_matches",
+        "missing_profile_terms",
+        "source_type",
+        "domain",
+        "url",
+        "fallback_search",
+        "snippet",
+    ]
+
+    df = df[
+        [c for c in columns if c in df.columns]
+    ]
+
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    prefix = (
+        f"cybersecurity_jobs_{timestamp}"
+    )
+
+    csv_file, html_file = export_reports(
+        df,
+        prefix,
+    )
+
+    # Console summary
+    print("\n" + "=" * 75)
+    print("TOP MATCHES")
+    print("=" * 75)
+
+    for i, (_, row) in enumerate(
+        df.head(25).iterrows(),
+        start=1,
+    ):
+        print(
+            f"{i:>2}. {int(row['score']):>3}/100 | "
+            f"{row['fit']:<18} | "
+            f"{row['target_company']}"
+        )
+        print(
+            f"    {row['title'][:100]}"
+        )
+        print(
+            f"    Location: {row['location']} | "
+            f"{row['employer_status']}"
+        )
+        print(
+            f"    Skills: "
+            f"{str(row['skill_matches'])[:220]}"
+        )
+        print(
+            f"    URL: {row['url']}"
+        )
+        print()
+
+    print("=" * 75)
+    print(f"CSV report : {csv_file}")
+    print(f"HTML report: {html_file}")
+    print(f"Total exported matches: {len(df)}")
+    print("=" * 75)
+
+
+if __name__ == "__main__":
+    main()
